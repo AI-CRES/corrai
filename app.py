@@ -1,22 +1,15 @@
-import os
 import streamlit as st
-import pandas as pd
-import time
-import tempfile
 import openai
-from azure.cognitiveservices.vision.computervision import ComputerVisionClient
-from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
-from msrest.authentication import CognitiveServicesCredentials
-from io import BytesIO
 import base64
+import pandas as pd
+from io import BytesIO
+from PIL import Image
+import fitz  # PyMuPDF
+import io
+import re
+from typing import List, Dict, Any
 
-# Install the required Azure library
-# os.system("pip install --upgrade azure-cognitiveservices-vision-computervision")
-# os.system("pip install openai")
 
-# Set up environment variables for Azure Cognitive Services
-#  st.write('Enter your secret computer vision key:')
-# Hide the default Streamlit menu and footer
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
@@ -26,150 +19,407 @@ hide_streamlit_style = """
     """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
-# Enter your secret computer vision key
-cv_key = st.secrets["CV_KEY"]
+def image_to_base64(image_file):
+    return base64.b64encode(image_file.read()).decode('utf-8')
 
-# Change the cv_endpoint below to your endpoint.
-cv_endpoint = st.secrets["ENDPOINT_KEY"]
+def display_image_from_base64(encoded_image):
+    image_data = base64.b64decode(encoded_image)
+    image = Image.open(io.BytesIO(image_data))
+    return image
 
-openai_api_key = st.secrets["API_KEY"]
-
-# Do some basic validation
-if len(cv_key) == 32:
-    st.success("Succès, la clé COMPUTER_VISION_SUBSCRIPTION_KEY est chargée.")
-else:
-    st.error("Erreur, la clé COMPUTER_VISION_SUBSCRIPTION_KEY n'a pas la longueur attendue, veuillez vérifier.")
-
-# Authenticate with Azure Cognitive Services
-computervision_client = None
-if cv_key and cv_endpoint:
-    computervision_client = ComputerVisionClient(cv_endpoint, CognitiveServicesCredentials(cv_key))
-
-# Function to extract text from an image using Azure Cognitive Services
-def extract_text_from_image(image_path):
-    with open(image_path, "rb") as image_stream:
-        read_response = computervision_client.read_in_stream(image_stream, raw=True)
-    
-    read_operation_location = read_response.headers["Operation-Location"]
-    operation_id = read_operation_location.split("/")[-1]
-
-    while True:
-        read_result = computervision_client.get_read_result(operation_id)
-        if read_result.status.lower() not in ['notstarted', 'running']:
-            break
-        time.sleep(1)
-    
-    extracted_text = ""
-    if read_result.status == OperationStatusCodes.succeeded:
-        for text_result in read_result.analyze_result.read_results:
-            for line in text_result.lines:
-                extracted_text += line.text + "\n"
-    
-    return extracted_text
-
-# Set up the Streamlit app layout
-st.title("CorrAI : Système de Correction de Copies")
-st.write("Téléchargez une copie de référence et des copies d'étudiants pour une correction automatique.")
-
-# Input section for the reference copy
-st.header("Copie de Référence")
-reference_image = st.file_uploader("Téléchargez la copie de référence sous forme de fichier image :", type=["jpg", "jpeg", "png"])
-
-reference_text = ""
-if reference_image:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-        tmp_file.write(reference_image.getbuffer())
-        reference_image_path = tmp_file.name
-
-    reference_text = extract_text_from_image(reference_image_path)
-    st.text_area("Texte Extrait de la Copie de Référence", reference_text, height=200)
-
-# Input section for student copies
-st.header("Copies des Étudiants")
-uploaded_files = st.file_uploader("Téléchargez les copies des étudiants sous forme de fichiers image :", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
-
-# Function to calculate the grade using ChatGPT 3.5-turbo
-def grade_student_copy(reference, student, api_key):
-    openai.api_key = api_key
-    
-    prompt = f"""
-    Réponse de référence :
-    {reference}
-
-    Réponse de l'étudiant :
-    {student}
-
-    Veuillez évaluer la réponse de l'étudiant en fonction de sa précision par rapport à la réponse de référence. Fournissez une note entre 0 et 100 et un court retour.
-    """
-
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "Vous êtes un assistant utile qui évalue les réponses des étudiants en fonction d'une réponse de référence."},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=150,
-        temperature=0.1,
-        top_p=1
-    )
-
+# Si l'image contient des éléments non textuels, comme des cases à cocher, des réponses encerclées, ou d'autres éléments graphiques, décrivez-les de manière détaillée pour chaque question et indiqué qu'elle est cochée en utilisant le mot "coché" au debut.
+def extract_content_from_image_reference(encoded_image, api_key,  vision_prompt):
     try:
-        feedback = response['choices'][0]['message']['content'].strip()
-        score_line = feedback.split('\n')[0]
-        score = int(''.join(filter(str.isdigit, score_line)))
-    except (KeyError, IndexError, ValueError):
-        score = "Erreur"
-        feedback = "Erreur lors de la génération de la note."
-
-    return score, feedback
-
-# Processing the uploaded student copies
-if st.button("Évaluer les Copies des Étudiants"):
-    
-    if reference_text and uploaded_files and openai_api_key:
-        results = []
-        for i, uploaded_file in enumerate(uploaded_files):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                tmp_file.write(uploaded_file.getbuffer())
-                student_image_path = tmp_file.name
+        openai.api_key = api_key
+        prompt = f"""
+        Vous êtes un assistant qui identifie les noms des étudiants et identifie toutes  les questions , 
+        reponse  et la ponderation (si ca existe) associer, en les reproduisant fidelement(sans analyser) comme transcrit sans analyser.
+        Extraire  ou recuperer exactement ce qui se trouve sur l'image sans ajouter ni retrancher. en retranscrivant les contenues.
+        les reponses peuvent manuscrit.
+        
+        Dire obligatoirement s'il y a des questions à choix multiples ou des questions de correspondance ou autres types des questions.
+        
+        Si le texte dans l'image ne peut pas être extrait directement, décrivez les éléments visuels présents, mais pas en detaille.
+        
+         {vision_prompt}
+        
+        """
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            },
+                        },
+                    ],
+                }
+            ],
             
-            student_text = extract_text_from_image(student_image_path)
-            score, feedback = grade_student_copy(reference_text, student_text, openai_api_key)
-            student_name = os.path.splitext(uploaded_file.name)[0]
-            results.append({"Numéro": i+1, "Nom de l'Étudiant": student_name, "Note": score, "Retour": feedback})
+        )
+        content = response['choices'][0]['message']['content']
+        return content
+    except openai.error.OpenAIError as e:
+        st.error(f"Erreur lors de la communication avec l'API OpenAI: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Erreur inattendue: {e}")
+        return None
+    
 
-        # Display the results
-        df_results = pd.DataFrame(results)
-        st.header("Résultats")
-        st.dataframe(df_results)
 
-        # Function to convert DataFrame to CSV
-        def convert_df_to_csv(df):
-            return df.to_csv(index=False).encode('utf-8')
 
-        # Function to convert DataFrame to Excel
-        def convert_df_to_excel(df):
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Résultats')
-                writer.close()
-            processed_data = output.getvalue()
-            return processed_data
+# Si l'image contient des éléments non textuels, comme des cases à cocher, des réponses encerclées, ou d'autres éléments graphiques, décrivez-les de manière détaillée pour chaque question et indiqué qu'elle est cochée en utilisant le mot "coché" au debut.
+def extract_content_from_image(encoded_image, api_key, vision_prompt, reference_content, promptmetas):
+    try:
+        openai.api_key = api_key
+        prompt = f"""
+        Vous êtes un assistant temporaire, Vous n'avez pas l'autorisation de mémoriser ou de stocker les informations de cette conversation aussi , 
+        Vous êtes un assistant qui identifie le nom l'étudiant et identifie toutes  les questions , 
+        les reponses associer et la ponderation (si ca existe) associer. 
+        
+               
+        Si une réponse inclut une image, analysez son contenu visuel et fournissez une description concise et pertinente de l'image.
+        
+        Dire obligatoirement s'il y a des questions à choix multiples ou des questions de correspondance ou autres types des questions.
+        
+        Si le texte dans l'image ne peut pas être extrait directement, décrivez les éléments visuels présents, mais pas en detaille.
+        
+        {vision_prompt}
+        
+        """
 
-        # Download results as CSV
-        csv = convert_df_to_csv(df_results)
-        st.download_button(
-            label="Télécharger les résultats en format CSV",
-            data=csv,
-            file_name='resultats.csv',
-            mime='text/csv'
+        promptmeta = f"""
+        "Vous êtes un assistant temporaire, Vous n'avez pas l'autorisation de mémoriser ou de stocker les informations de cette conversation: 
+        Ce qu'il faut respecter strictement:
+        1. Le Contenu Extrait de la Copie de Référence est utilisé seulement, j'insiste seulement lorsque  vous avez de difficulé à predire ou detecter un texte qui existe et peu visible, donc
+        les textes moins visible(difficile à extraire)
+        2. Sur Contenu Extrait de la Copie d'Étudiant, vous n'avez pas l'autorisation d'ajouter de textes ou des mots là où il y du vide 
+        (respecter ce consignes stritement pour les cas où la reponse est vide).
+        {promptmetas }
+        
+        voici la copie de reference:
+        {reference_content}
+        
+         """
+        
+        
+        response = openai.ChatCompletion.create(
+            model="chatgpt-4o-latest",
+            messages=[
+                #{"role": "system", "content":  promptmeta },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            
+        )
+        content = response['choices'][0]['message']['content']
+        return content
+    except openai.error.OpenAIError as e:
+        st.error(f"Erreur lors de la communication avec l'API OpenAI: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Erreur inattendue: {e}")
+        return None
+
+def grade_student_copy(reference_content, student_content, api_key, chatgpt_prompt,ortho_weight, syntax_weight, logic_weight): 
+    try:
+        openai.api_key = api_key
+        
+        prompt = f"""
+        Réponse de référence :
+        {reference_content}
+
+        Réponse de l'étudiant :
+        {student_content}
+
+        Veuillez effectuer les tâches suivantes :
+        {chatgpt_prompt}
+        
+        
+        on doit avoir obligatoirement un Court Commentaire expliquant la note,
+        en insistant sur les erreurs et les réussites si applicables(en expliquant chaque point attribuer à une question, justifier pourquoi à avoir donné des points à une questions )
+
+        """
+
+
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Vous êtes un assistant temporaire. Vous n'avez pas l'autorisation de mémoriser ou de stocker les informations de cette conversation aussi Vous êtes un assistant qui identifie les noms des étudiants et évalue leurs réponses en tenant compte des pondérations spécifiées pour chaque partie de la réponse de référence."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.9,
+            top_p=1
         )
 
-        # Download results as Excel
-        excel = convert_df_to_excel(df_results)
-        b64 = base64.b64encode(excel).decode('utf-8')
-        href = f'<a href="data:application/octet-stream;base64,{b64}" download="resultats.xlsx">Télécharger les résultats en format Excel</a>'
-        st.markdown(href, unsafe_allow_html=True)
-    else:
-        st.error("Veuillez entrer la copie de référence, télécharger au moins une copie d'étudiant et fournir la clé API OpenAI.")
+        content = response['choices'][0]['message']['content'].strip()
+        lines = content.split('\n')
 
+        pattern = r'(?:\*\*)?Nom de l\'étudiant\s*:\s*(?:\*\*)?\s*([A-Za-zÀ-ÿ\- ]+)'
+        name_match = re.search(pattern, content, re.IGNORECASE)
+        nom = name_match.group(1).strip() if name_match else 'Inconnu'
+        name=nom
+        
+        score = "Erreur"
+        feedback = "Pas de commentaire."
+
+        # Parcourir les lignes pour extraire les informations
+        for line in lines:
+            if line.startswith("Nom de l'étudiant"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("Note"):
+                score_text = line.split(":", 1)[1].strip()
+                # Utiliser la méthode améliorée pour extraire la note
+                score_match = re.search(r"([\d.,]+)(?:/([\d.,]+))?", score_text)
+                if score_match:
+                    numerator = float(score_match.group(1).replace(',', '.'))
+                    denominator = score_match.group(2)
+                    if denominator:
+                        denominator = float(denominator.replace(',', '.'))
+                        score = (numerator / denominator) * 100  # Normaliser si nécessaire
+                    else:
+                        score = numerator
+                else:
+                    score = "Erreur"
+            elif line.startswith("Commentaire"):
+                feedback = line.split(":", 1)[1].strip()
+
+    except openai.error.OpenAIError as e:
+        st.error(f"Erreur lors de la communication avec l'API OpenAI: {e}")
+        name, score, feedback, content = "Erreur API", "Erreur", "Impossible d'évaluer.", "Content"
+
+    except Exception as e:
+        st.error(f"Erreur inattendue: {e}")
+        name, score, feedback, content = "Erreur", "Erreur", "Erreur inattendue.", "Content"
+
+    return name, score, feedback , content 
+
+def to_csv(df):
+    output = BytesIO()
+    df.to_csv(output, index=False)
+    return output.getvalue().decode('utf-8')
+
+def extract_images_from_pdf(pdf_file):
+    try:
+        images = []
+        pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        
+        for page_num in range(len(pdf_document)):
+            page = pdf_document.load_page(page_num)
+            image_list = page.get_images(full=True)
+            
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                base_image = pdf_document.extract_image(xref)
+                image_bytes = base_image["image"]
+                image = Image.open(io.BytesIO(image_bytes))
+                images.append(image)
+        
+        return images
+    except Exception as e:
+        st.error(f"Erreur lors de l'extraction des images du PDF: {e}")
+        return []
+
+def extract_latex_and_text(content):
+    pattern = r'(?s)(.*?)\\\[([\s\S]*?)\\\]'
+
+    matches = re.finditer(pattern, content)
+
+    parts = []
+    last_pos = 0
+
+    for match in matches:
+        before_latex = match.group(1)
+        latex_content = match.group(2)
+        
+        if before_latex.strip():
+            parts.append(('text', before_latex.strip()))
+
+        parts.append(('latex', latex_content.strip()))
+        last_pos = match.end()
+
+    remaining_text = content[last_pos:].strip()
+    if remaining_text:
+        parts.append(('text', remaining_text))
+
+    return parts
+  
+def parse_report_single(text: str) -> Dict[str, Any]:
+    """
+    Analyse le rapport d'évaluation d'un seul étudiant et extrait les informations nécessaires.
+
+    Args:
+        text (str): Le texte complet du rapport d'évaluation pour un étudiant.
+
+    Returns:
+        Dict[str, Any]: Un dictionnaire contenant le nom de l'étudiant, les points obtenus, les points totaux et le commentaire.
+    """
+    # Extraire le nom de l'étudiant
+    name_match = re.search(r'Nom de l\'étudiant\s*:\s*([^\n\*]+)', text, re.IGNORECASE)
+    nom = name_match.group(1).strip() if name_match else 'Inconnu'
+
+    # Extraire les points attribués
+    points_patterns = re.compile(r'(?:\*+\s*)?Points attribués\s*:\s*\**\s*(\d+)\s*/\s*(\d+)',re.IGNORECASE)                           
+    # Expression régulière finale ajustée
+    points_pattern = re.compile( r'(?:\*+\s*)?Points attribués(?:\*+\s*)?\s*:\s*\**\s*(\d+)\s*/\s*(\d+)',re.IGNORECASE)
+
+    points_matches = points_pattern.findall(text)
+    print(f"{points_matches}")
+
+    # Calculer la somme des points attribués et des points totaux si des correspondances sont trouvées
+    if points_matches:
+        points_obtenus = sum(int(match[0]) for match in points_matches)
+        points_totaux = sum(int(match[1]) for match in points_matches)
+    else:
+        points_obtenus = 0
+        points_totaux = 0
+
+    # Extraire le commentaire global (facultatif)
+    commentaire_pattern = re.compile(r'Court Commentaire expliquant la note\s*:\s*(.*)', re.IGNORECASE | re.DOTALL)
+    commentaire_match = commentaire_pattern.search(text)
+    commentaire = commentaire_match.group(1).strip() if commentaire_match else ''
+
+    return {
+        'Nom de l\'étudiant': nom,
+        'Points obtenus': points_obtenus,
+        'Points totaux': points_totaux,
+        'Commentaire': commentaire
+    }
+
+def calculer_note_finale(data: Dict[str, Any]) -> str:
+    """
+    Calcule la note finale sous la forme "x/y".
+
+    Args:
+        data (Dict[str, Any]): Un dictionnaire contenant les données d'un étudiant.
+
+    Returns:
+        str: La note finale formatée, par exemple "3/10".
+    """
+    pointobtenu = data.get('Points obtenus', 0)
+    pointtotaux = data.get('Points totaux', 0)
+    print(f"{pointobtenu}/{pointtotaux}")
+
+    return f"{pointobtenu}/{pointtotaux}" if pointtotaux > 0 else "0/0"
+
+
+st.title("Système de correction des Copies")
+
+st.header("Télécharger la Copie de Référence (PDF)")
+reference_file = st.file_uploader("Téléchargez le PDF de la copie de référence", type=["pdf"])
+
+st.header("Télécharger les Copies des Étudiants (PDFs)")
+student_files = st.file_uploader("Téléchargez les PDFs des copies des étudiants", type=["pdf"], accept_multiple_files=True)
+
+st.header("Définir les Niveaux de Correction")
+ortho_weight = 30
+syntax_weight =  40
+logic_weight = 30
+
+vision_prompt = st.text_area("Entrez le prompt pour la vision :", height=100)
+promptmeta =""  #st.text_area("Entrez le prompt pour la vision student metaprompt :", height=100)
+chatgpt_prompt = st.text_area("Entrez le prompt pour la correction:", height=200)
+
+api_key = st.secrets["API_KEY"]
+
+if st.button("Lancer la correction"):
+    if reference_file and student_files and api_key:
+        with st.spinner('Correction en cours...'):
+            try:
+                reference_images = extract_images_from_pdf(reference_file)
+                
+                reference_texts = []
+                for ref_img in reference_images:
+                    ref_image_bytes = io.BytesIO()
+                    ref_img.save(ref_image_bytes, format="PNG")
+                    ref_image_base64 = base64.b64encode(ref_image_bytes.getvalue()).decode('utf-8')
+                    reference_content = extract_content_from_image_reference(ref_image_base64, api_key, vision_prompt)
+                    if reference_content:
+                        reference_texts.append(reference_content)
+                
+                if not reference_texts:
+                    st.warning("Impossible d'extraire du contenu de la copie de référence.")
+                    st.stop()
+
+                reference_text_combined = "\n".join(reference_texts)
+                st.subheader("Copie de Référence")
+                for ref_img in reference_images:
+                    st.image(ref_img, caption="Copie de Référence")
+                
+                st.write("Contenu Extrait de la Copie de Référence :")
+                parts = extract_latex_and_text(reference_text_combined)
+                for part_type, content in parts:
+                    if part_type == 'text':
+                        st.write(content)
+                    elif part_type == 'latex':
+                        st.latex(content)
+                
+                results = []
+
+                for student_file in student_files:
+                    student_images = extract_images_from_pdf(student_file)
+                    
+                    student_texts = []
+                    for student_img in student_images:
+                        student_image_bytes = io.BytesIO()
+                        student_img.save(student_image_bytes, format="PNG")
+                        student_image_base64 = base64.b64encode(student_image_bytes.getvalue()).decode('utf-8')
+                        student_content = extract_content_from_image(student_image_base64, api_key, vision_prompt,reference_content,promptmeta )
+                        if student_content:
+                            student_texts.append(student_content)
+                    
+                    if not student_texts:
+                        st.warning(f"Impossible d'extraire du contenu pour la copie {student_file.name}.")
+                        continue
+
+                    student_text_combined = "\n".join(student_texts)
+                    
+                    
+                    
+                    st.subheader(f"Copie d'Étudiant : {student_file.name}")
+                    for student_img in student_images:
+                        st.image(student_img, caption=f"Copie d'Étudiant : {student_file.name}")
+                    
+                    st.write("Contenu Extrait de la Copie d'Étudiant :")
+                    parts = extract_latex_and_text(student_text_combined)
+                    for part_type, content in parts:
+                        if part_type == 'text':
+                            st.write(content)
+                        elif part_type == 'latex':
+                            st.latex(content)
+                    
+                    name, score, feedback, Contents = grade_student_copy(reference_text_combined, student_text_combined, api_key, chatgpt_prompt, ortho_weight, syntax_weight, logic_weight)
+                    st.write(f"Nom: {name}, Note: {score}, Commentaire: {feedback}")
+                    data_extracted = parse_report_single(Contents)
+                    data=calculer_note_finale(data_extracted)
+                    print(data)
+                    results.append({"Nom": name, "Note": data, "Commentaire": Contents})
+                
+                st.write(Contents)
+                df_results = pd.DataFrame(results)
+                st.dataframe(df_results)
+                csv_data = to_csv(df_results)
+                st.download_button("Télécharger les résultats au format CSV", data=csv_data, file_name="results.csv", mime="text/csv")
+
+            except Exception as e:
+                st.error(f"Une erreur s'est produite lors de la correction : {e}")
+    else:
+        st.warning("Veuillez télécharger tous les fichiers nécessaires et fournir la clé API.")
