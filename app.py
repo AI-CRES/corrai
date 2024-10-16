@@ -111,7 +111,7 @@ def extract_content_from_image(encoded_image, api_key, vision_prompt, reference_
         
         
         response = openai.ChatCompletion.create(
-            model="chatgpt-4o-latest",
+            model="gpt-4o",
             messages=[
                 #{"role": "system", "content":  promptmeta },
                 {
@@ -161,7 +161,7 @@ def grade_student_copy(reference_content, student_content, api_key, chatgpt_prom
 
 
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Vous êtes un assistant temporaire. Vous n'avez pas l'autorisation de mémoriser ou de stocker les informations de cette conversation aussi Vous êtes un assistant qui identifie les noms des étudiants et évalue leurs réponses en tenant compte des pondérations spécifiées pour chaque partie de la réponse de référence."},
                 {"role": "user", "content": prompt}
